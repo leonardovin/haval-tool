@@ -52,7 +52,13 @@ main() {
     download "https://haval.joaoiot.com.br/fridainject.rar" "fridainject" "fridainject"
     download "https://haval.joaoiot.com.br/system_server.js" "system_server.js" "system_server.js"
     download "$(get_latest_release "https://github.com/RikkaApps/Shizuku")" "shizuku.apk" "Shizuku APK"
-    download "$(get_latest_release "https://github.com/bobaoapae/haval-app-tool-multimidia")" "haval.apk" "Haval APK"
+    if [ -n "$HAVAL_APK_URL" ]; then
+        log "INFO" "Usando versao fixada: $HAVAL_APK_URL"
+        haval_url="$HAVAL_APK_URL"
+    else
+        haval_url="$(get_latest_release "https://github.com/bobaoapae/haval-app-tool-multimidia")"
+    fi
+    download "$haval_url" "haval.apk" "Haval APK"
     
     # Permissoes
     log "INFO" "Fase 2: Permissoes"

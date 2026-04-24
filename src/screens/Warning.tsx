@@ -1,5 +1,5 @@
 import { useState } from 'react'
-import { Link, useNavigate } from 'react-router-dom'
+import { Link, useLocation, useNavigate } from 'react-router-dom'
 import { AlertTriangleIcon, ArrowLeftIcon } from 'lucide-react'
 import { invoke } from '@tauri-apps/api/core'
 
@@ -8,7 +8,9 @@ export const Warning = () => {
   const [isChecking, setIsChecking] = useState(false)
   const [networkError, setNetworkError] = useState<string | null>(null)
   const navigate = useNavigate()
-  
+  const location = useLocation()
+  const apkUrl = (location.state as { apkUrl?: string | null } | null)?.apkUrl ?? null
+
   const handleAcknowledge = () => {
     setAcknowledged(true)
     setNetworkError(null)
@@ -21,7 +23,7 @@ export const Warning = () => {
     try {
       // Verifica se está na rede Haval antes de navegar
       await invoke('is_haval_hotspot')
-      navigate('/install/terminal')
+      navigate('/install/terminal', { state: { apkUrl } })
     } catch (e: any) {  
       setNetworkError(e.toString())
     } finally {

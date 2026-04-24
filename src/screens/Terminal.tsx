@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import { useNavigate } from 'react-router-dom'
+import { useLocation, useNavigate } from 'react-router-dom'
 import { RefreshCwIcon, ArrowLeftIcon, PlayIcon, BugIcon } from 'lucide-react'
 import { Terminal as TerminalComponent, DebugModal } from '../components'
 import { invoke } from '@tauri-apps/api/core'
@@ -14,6 +14,8 @@ export const Terminal = () => {
   const [isDebugEnabled, setIsDebugEnabled] = useState(false)
   const [isDebugModalOpen, setIsDebugModalOpen] = useState(false)
   const navigate = useNavigate()
+  const location = useLocation()
+  const apkUrl = (location.state as { apkUrl?: string | null } | null)?.apkUrl ?? null
 
   useEffect(() => {
     setOutput([])
@@ -57,7 +59,7 @@ export const Terminal = () => {
     }, 2000)
     
     try {
-      await invoke('inject_script')
+      await invoke('inject_script', { apkUrl })
       setOutput((prev: string[]) => [...prev, 'Script injectado com sucessso!'])
       setOutput((prev: string[]) => [...prev, 'Aguarde a instalação...'])
     } catch (e) {

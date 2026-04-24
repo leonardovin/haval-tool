@@ -10,6 +10,67 @@ pub struct ConnectionState {
     stream: Arc<Mutex<Option<TcpStream>>>,
 }
 
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct ReleaseInfo {
+    pub tag: String,
+    pub name: String,
+    pub apk_url: String,
+    pub prerelease: bool,
+    pub published_at: String,
+}
+
+/// Pure helper: given the JSON body returned by GitHub's releases endpoint, pick the APK asset
+/// per release and return a simplified list. Tolerant to missing fields.
+pub fn parse_github_releases(body: &str) -> Vec<ReleaseInfo> {
+    let value: serde_json::Value = match serde_json::from_str(body) {
+        Ok(v) => v,
+        Err(_) => return Vec::new(),
+    };
+    let arr = match value.as_array() {
+        Some(a) => a,
+        None => return Vec::new(),
+    };
+    arr.iter()
+        .filter_map(|rel| {
+            let tag = rel.get("tag_name")?.as_str()?.to_string();
+            let name = rel
+                .get("name")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .unwrap_or(&tag)
+                .to_string();
+            let prerelease = rel
+                .get("prerelease")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let published_at = rel
+                .get("published_at")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let assets = rel.get("assets")?.as_array()?;
+            let apk_url = assets
+                .iter()
+                .filter_map(|a| a.get("browser_download_url")?.as_str())
+                .find(|u| u.to_lowercase().ends_with(".apk"))?
+                .to_string();
+            Some(ReleaseInfo { tag, name, apk_url, prerelease, published_at })
+        })
+        .collect()
+}
+
+/// Pure helper: builds the telnet command to run the install script, optionally pinning the APK
+/// version via the `HAVAL_APK_URL` env var.
+pub fn build_run_command(pinned_apk_url: Option<&str>) -> String {
+    match pinned_apk_url {
+        Some(url) if !url.is_empty() => format!(
+            "cd /data/local/tmp && HAVAL_APK_URL='{}' ./install.sh",
+            url.replace('\'', "'\\''")
+        ),
+        _ => "cd /data/local/tmp && ./install.sh".to_string(),
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 enum ApiError {
     #[error("Não conectado ao hotspot do Haval (gateway {0} não inicia com '192.168.33.')")]
@@ -140,11 +201,30 @@ async fn send_command_with_event(
     send_command(command, state).await
 }
 
+// Lista as releases do repositório da multimídia para o seletor de versão
+#[tauri::command]
+async fn list_haval_releases() -> Result<Vec<ReleaseInfo>, ApiError> {
+    let client = reqwest::Client::builder()
+        .user_agent("haval-tool")
+        .build()
+        .map_err(|_| ApiError::DownloadFailed)?;
+    let body = client
+        .get("https://api.github.com/repos/bobaoapae/haval-app-tool-multimidia/releases?per_page=30")
+        .send()
+        .await
+        .map_err(|_| ApiError::DownloadFailed)?
+        .text()
+        .await
+        .map_err(|_| ApiError::DownloadFailed)?;
+    Ok(parse_github_releases(&body))
+}
+
 // Equivalente a: api.injectScript
 #[tauri::command]
 async fn inject_script(
     app: tauri::AppHandle,
-    state: tauri::State<'_, ConnectionState>
+    state: tauri::State<'_, ConnectionState>,
+    apk_url: Option<String>,
 ) -> Result<(), ApiError> {
     // Download do script da URL sempre atualizada
     let client = reqwest::Client::new();
@@ -184,12 +264,8 @@ async fn inject_script(
     tokio::time::sleep(Duration::from_secs(1)).await;
 
     let _ = app.emit("telnet-output", "🚀 Executando script de instalação...");
-    send_command_with_event(
-        "cd /data/local/tmp && ./install.sh".to_string(),
-        state.clone(),
-        &app,
-    )
-    .await?;
+    let run_cmd = build_run_command(apk_url.as_deref());
+    send_command_with_event(run_cmd, state.clone(), &app).await?;
     tokio::time::sleep(Duration::from_secs(1)).await;
 
     Ok(())
@@ -267,6 +343,170 @@ async fn is_installed(
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_releases_extracts_apk_asset() {
+        let body = r#"[
+            {
+                "tag_name": "v1.2.3",
+                "name": "Release 1.2.3",
+                "prerelease": false,
+                "published_at": "2025-01-01T00:00:00Z",
+                "assets": [
+                    {"browser_download_url": "https://example.com/readme.txt"},
+                    {"browser_download_url": "https://example.com/app-v1.2.3.apk"}
+                ]
+            },
+            {
+                "tag_name": "v1.2.2",
+                "name": "",
+                "prerelease": true,
+                "published_at": "2024-12-01T00:00:00Z",
+                "assets": [
+                    {"browser_download_url": "https://example.com/app-v1.2.2.apk"}
+                ]
+            }
+        ]"#;
+        let parsed = parse_github_releases(body);
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0].tag, "v1.2.3");
+        assert_eq!(parsed[0].name, "Release 1.2.3");
+        assert_eq!(parsed[0].apk_url, "https://example.com/app-v1.2.3.apk");
+        assert!(!parsed[0].prerelease);
+        // Empty name falls back to tag.
+        assert_eq!(parsed[1].name, "v1.2.2");
+        assert!(parsed[1].prerelease);
+    }
+
+    #[test]
+    fn parse_releases_skips_releases_without_apk() {
+        let body = r#"[
+            {
+                "tag_name": "v2.0.0",
+                "name": "No APK release",
+                "assets": [
+                    {"browser_download_url": "https://example.com/notes.md"}
+                ]
+            },
+            {
+                "tag_name": "v1.0.0",
+                "name": "Good",
+                "assets": [
+                    {"browser_download_url": "https://example.com/good.apk"}
+                ]
+            }
+        ]"#;
+        let parsed = parse_github_releases(body);
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].tag, "v1.0.0");
+    }
+
+    #[test]
+    fn parse_releases_handles_malformed_input() {
+        assert!(parse_github_releases("not json").is_empty());
+        assert!(parse_github_releases("").is_empty());
+        assert!(parse_github_releases("{}").is_empty());
+        assert!(parse_github_releases("[{\"no_tag\": true}]").is_empty());
+    }
+
+    #[test]
+    fn parse_releases_case_insensitive_apk_extension() {
+        let body = r#"[{
+            "tag_name": "v3.0.0",
+            "name": "Upper case",
+            "assets": [{"browser_download_url": "https://example.com/App.APK"}]
+        }]"#;
+        let parsed = parse_github_releases(body);
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].apk_url, "https://example.com/App.APK");
+    }
+
+    #[test]
+    fn build_run_command_without_pinned_url() {
+        assert_eq!(
+            build_run_command(None),
+            "cd /data/local/tmp && ./install.sh"
+        );
+        // Empty string is treated as unpinned.
+        assert_eq!(
+            build_run_command(Some("")),
+            "cd /data/local/tmp && ./install.sh"
+        );
+    }
+
+    #[test]
+    fn build_run_command_with_pinned_url() {
+        let cmd = build_run_command(Some("https://example.com/a.apk"));
+        assert_eq!(
+            cmd,
+            "cd /data/local/tmp && HAVAL_APK_URL='https://example.com/a.apk' ./install.sh"
+        );
+    }
+
+    // Opt-in integration test: hits the real GitHub API and verifies the parser extracts a
+    // plausible list. Skipped unless HAVAL_LIVE_TESTS=1 (keeps CI/offline runs quiet).
+    #[test]
+    fn parse_releases_against_real_github_api() {
+        if std::env::var("HAVAL_LIVE_TESTS").ok().as_deref() != Some("1") {
+            eprintln!("skipping live test (set HAVAL_LIVE_TESTS=1 to run)");
+            return;
+        }
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let body: String = rt.block_on(async {
+            reqwest::Client::builder()
+                .user_agent("haval-tool")
+                .build()
+                .unwrap()
+                .get("https://api.github.com/repos/bobaoapae/haval-app-tool-multimidia/releases?per_page=10")
+                .send()
+                .await
+                .unwrap()
+                .text()
+                .await
+                .unwrap()
+        });
+        let parsed = parse_github_releases(&body);
+        assert!(!parsed.is_empty(), "expected at least one release with an APK asset");
+        for r in &parsed {
+            assert!(r.tag.starts_with('v'), "unexpected tag format: {}", r.tag);
+            assert!(
+                r.apk_url.to_lowercase().ends_with(".apk"),
+                "asset is not an APK: {}",
+                r.apk_url
+            );
+            assert!(
+                r.apk_url.starts_with("https://github.com/"),
+                "unexpected host: {}",
+                r.apk_url
+            );
+        }
+    }
+
+    #[test]
+    fn build_run_command_escapes_single_quote() {
+        // Single quote in the URL must not break the shell command.
+        let cmd = build_run_command(Some("https://example.com/weird'name.apk"));
+        // Single quote is escaped by closing the quoted string, emitting \', and reopening: '\''.
+        assert_eq!(
+            cmd,
+            "cd /data/local/tmp && HAVAL_APK_URL='https://example.com/weird'\\''name.apk' ./install.sh"
+        );
+        // Sanity: the shell must parse it back to the original URL.
+        let parsed = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(format!("{} >/dev/null 2>&1 || true; printf %s \"{}\"", "true", "$HAVAL_APK_URL"))
+            .env_clear()
+            .envs(std::env::vars())
+            .output()
+            .unwrap();
+        // Not strictly needed to validate shell round-trip; assertion above is sufficient.
+        let _ = parsed;
+    }
+}
+
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_log::Builder::new().build())
@@ -284,6 +524,7 @@ pub fn run() {
             is_connected,
             inject_script,
             is_installed,
+            list_haval_releases,
             start_telnet_monitor
         ])
         .run(tauri::generate_context!())

@@ -18,7 +18,7 @@ export const Install = () => {
           </p>
           <div className="space-y-4">
             <Link
-              to="/install/warning"
+              to="/install/version"
               className="block w-full bg-blue-600 text-white text-center py-4 px-6 rounded-xl hover:bg-blue-700 transition-all duration-300 shadow-lg hover:shadow-blue-600/30 font-medium"
             >
               Continuar com a Instalação
